@@ -1,0 +1,9 @@
+# Secrets
+config.local.js
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+node_modules/
