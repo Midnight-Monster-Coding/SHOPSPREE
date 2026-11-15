@@ -1,9 +1,14 @@
 # Secrets
+.dev.vars
+.env
 config.local.js
+
+# Wrangler / Node
+.wrangler/
+node_modules/
 
 # OS / editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-node_modules/
