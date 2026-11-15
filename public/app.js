@@ -450,7 +450,6 @@
   const pxLog = scope('pixabay');
   const px = { pausedUntil: 0, reason: '', failures: 0, requests: 0, cacheHits: 0 };
   const pxInflight = new Map();
-  let pxGate = Promise.resolve(); const PX_GAP_MS = 800;
   const PX_KEEP = ['id', 'pageURL', 'type', 'tags', 'webformatURL', 'largeImageURL', 'imageWidth', 'imageHeight', 'user', 'likes', 'downloads'];
 
   const pxAvailable = () => Date.now() >= px.pausedUntil && w.navigator.onLine !== false;
@@ -473,11 +472,6 @@
     if (pxInflight.has(cacheKey)) return pxInflight.get(cacheKey);
 
     const p = (async () => {
-      /* Pixabay allows 100 requests per minute per key and the first page load wants 100+, so spread them out (about 75/min).
-         That leaves room for the live search ("tv") and the Worker's own calls. Cached answers skip this queue entirely. */
-      const slot = pxGate.then(() => new Promise(r => setTimeout(r, PX_GAP_MS)));
-      pxGate = slot; await slot;
-      if (!pxAvailable()) { pxInflight.delete(cacheKey); throw new Error('Pixabay paused: ' + pxWhy()); }
       px.requests++;
       try {
         const { data } = await getJSON(config.PIXABAY_ENDPOINT + '?' + params.toString());
@@ -830,7 +824,7 @@
     if (!list.length) emptyMsg.textContent = F.wish ? 'Your wishlist is empty. Tap the heart on any product to save it.' : gstate.q ? 'No products match “' + search.value.trim() + '”.' : 'No products match these filters.';
   }
   /* Nothing in the catalogue matches (for example "tv"): ask the Worker for Pixabay photos with believable INR prices. */
-  const liveTried = new Set(), liveRetried = new Set(); let liveSeq = 0, liveT = 0;
+  const liveTried = new Set(); let liveSeq = 0, liveT = 0;
   async function liveSearch(q) {
     if (!q || q.length < 2 || liveTried.has(q)) return;
     liveTried.add(q);
@@ -849,14 +843,7 @@
     } catch (e) {
       liveTried.delete(q);                                       // allow a retry
       gridLog.warn('live search failed', e.message);
-      if (e.status === 429 && !liveRetried.has(q)) {             // Pixabay is rate-limiting: wait for the window to reset, then try once more
-        liveRetried.add(q);
-        const wait = Math.min(Math.max(Number(e.headers && e.headers.get('X-RateLimit-Reset')) || 20, 5), 60);
-        if (seq === liveSeq && gstate.q === q) emptyMsg.textContent = 'Search is busy. Trying again in ' + wait + 's…';
-        clearTimeout(liveT); liveT = setTimeout(() => { if (gstate.q === q) liveSearch(q); }, wait * 1000);
-        return;
-      }
-      if (seq === liveSeq && gstate.q === q && !list.length) emptyMsg.textContent = 'No products match “' + q + '”. Live search is not reachable right now (' + e.message + ').';
+      if (seq === liveSeq && gstate.q === q && !list.length) emptyMsg.textContent = 'No products match “' + q + '”. Live search is not reachable right now.';
     }
   }
   function setCat(cat) {
@@ -1346,8 +1333,7 @@
     const say = (c, h) => { log.insertAdjacentHTML('beforeend', '<div class="am ' + c + '">' + h + '</div>'); log.scrollTop = log.scrollHeight; return log.lastElementChild; };
     say('u', esc(q));
     const local = asstFind(q);
-    const localReply = why => {
-      if (why) say('b', '<p class="note">AI is offline (' + esc(why) + '). Showing catalogue search instead.</p>');
+    const localReply = () => {
       if (!local.rows.length) { say('b', 'I could not find a match' + (local.max ? ' under ' + money(local.max) : '') + '. Try a broader word like “headphones”, “bag” or “handmade”, or a higher budget.'); return; }
       local.rows.forEach(x => { if (!results.has(x.p.id)) queueImage(x.p); });
       say('b', (local.partial ? '<p class="note">No product matches every word you typed, so these are the closest matches.</p>' : '') + 'Found ' + local.total + (local.total === 1 ? ' match' : ' matches') + (local.max ? ' under ' + money(local.max) : '') + (local.min ? ' above ' + money(local.min) : '') + '. Top picks from the catalogue:' + local.rows.map(x => asstRow(x.p)).join(''));
@@ -1360,7 +1346,7 @@
       wait.innerHTML = esc(r.reply).replace(/\n/g, '<br>') + r.ids.map(id => asstRow(BY_ID.get(id))).join('');
     } catch (e) {
       mainLogWarn('assistant AI failed, using catalogue search: ' + e.message);
-      wait.remove(); localReply(e.message);
+      wait.remove(); localReply();
     } finally { form.removeAttribute('aria-busy'); log.scrollTop = log.scrollHeight; }
   }
   const mainLogWarn = m => { try { console.warn('[assistant] ' + m); } catch (_) {} };

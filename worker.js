@@ -10,8 +10,8 @@
      GEMINI_API_KEY   your Google AI Studio key
    Optional plain variable: GEMINI_MODEL (default gemini-2.5-flash), ALLOWED_ORIGINS (comma list of extra origins). */
 
-const DEFAULT_MODEL = 'gemini-flash-latest';       // alias that always points at the current Flash model; unknown names fall through the list in gemini()
-const FALLBACK_MODEL = 'gemini-3.8-flash';
+const DEFAULT_MODEL = 'gemini-3.8-flash';          // gemini-2.5-* is retired for new API keys (404)
+const FALLBACK_MODEL = 'gemini-flash-latest';
 const ADJ = ['Aura', 'Nova', 'Zenith', 'Lumen', 'Ember', 'Onyx', 'Solace', 'Vertex', 'Haven', 'Pulse', 'Echo', 'Drift'];
 const CATS = ['Fashion', 'Electronics', 'Home', 'Beauty', 'Crafts'];
 const PEOPLE = ['man', 'woman', 'girl', 'boy', 'people', 'child', 'children', 'baby', 'portrait', 'model', 'face', 'couple', 'family'];
@@ -84,23 +84,14 @@ function cleanQuery(raw) {
 }
 
 /* ---------------- Pixabay ---------------- */
-/* Per-isolate memory cache: the Cache API does nothing on *.workers.dev, so this is what keeps repeat queries
-   from burning Pixabay's 100-requests-per-minute limit. On a 429 the last answer (even an old one) is served instead. */
-const PX_MEM = new Map();
 async function pixabay(env, params) {
   if (!env.PIXABAY_KEY) throw Object.assign(new Error('PIXABAY_KEY is not set'), { status: 500 });
   const u = new URL('https://pixabay.com/api/');
   Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
-  const mk = u.searchParams.toString(), now = Date.now(), c = PX_MEM.get(mk);
-  if (c && now - c.t < 3600e3) return c.d;
   u.searchParams.set('key', env.PIXABAY_KEY);
   const res = await fetch(u.toString(), { cf: { cacheTtl: 86400, cacheEverything: true } });
-  if (res.status === 429 && c) return c.d;
-  if (!res.ok) throw Object.assign(new Error('Pixabay HTTP ' + res.status + (res.status === 429 ? ' (rate limit: 100 requests/minute per key)' : '')), { status: res.status === 429 ? 429 : 502, retry: res.headers.get('X-RateLimit-Reset') });
-  const d = await res.json();
-  if (PX_MEM.size > 300) PX_MEM.delete(PX_MEM.keys().next().value);
-  PX_MEM.set(mk, { t: now, d });
-  return d;
+  if (!res.ok) throw Object.assign(new Error('Pixabay HTTP ' + res.status), { status: res.status === 429 ? 429 : 502, retry: res.headers.get('X-RateLimit-Reset') });
+  return res.json();
 }
 
 /* Pass-through used by the existing photo pipeline: only whitelisted parameters, key added here. */
@@ -195,7 +186,7 @@ async function profileFor(env, q) {
         contents: [{ role: 'user', parts: [{ text: q }] }],
         generationConfig: { temperature: 0, maxOutputTokens: 600, responseMimeType: 'application/json' }
       });
-      const o = parseJson(txt);
+      const o = JSON.parse(txt.replace(/```json|```/g, '').trim());
       if (o.product === false) return null;
       let min = Math.max(49, Math.round(+o.minInr) || 0), max = Math.min(500000, Math.round(+o.maxInr) || 0);
       if (!(min > 0 && max > min)) { min = 499; max = 2999; }
