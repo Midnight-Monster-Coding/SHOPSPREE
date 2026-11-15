@@ -21,8 +21,8 @@
     PIXABAY_ENDPOINT: '/api/pixabay',         // Pixabay proxy
     SEARCH_ENDPOINT: '/api/search',           // live listing for searches the catalogue cannot answer (e.g. "tv")
     AI_ENDPOINT: '/api/assistant',            // Gemini shopping assistant
-    GEMINI_TIMEOUT_MS: 20000,
-    LIVE_TIMEOUT_MS: 15000,
+    GEMINI_TIMEOUT_MS: 35000,
+    LIVE_TIMEOUT_MS: 30000,
 
     DUMMYJSON_BASE: 'https://dummyjson.com',
     CACHE_TTL_MS: 24 * 60 * 60 * 1000,      // Pixabay requires API responses to be cached for 24 hours
@@ -307,11 +307,13 @@
 
   /* Live listing: products created from a search the built-in catalogue cannot answer (see worker.js /api/search).
      They join PRODUCTS/BY_ID, so cart, wishlist, quick view and compare work on them like on any other item. */
-  const DYN_KEY = 'ss.live.v2';                     // v2: older saved results had off-topic photos
+  const DYN_KEY = 'ss.live.v3';                     // v2: older saved results had off-topic photos
   function addLive(rows) {
     let added = 0;
     (Array.isArray(rows) ? rows : []).forEach(r => {
-      if (!r || BY_ID.has(r.id) || !CAT_LABEL[r.cat] || !/^\/api\/img\?u=/.test(r.img || '')) return;
+      if (!r || BY_ID.has(r.id) || !CAT_LABEL[r.cat]) return;
+      if (/^https:\/\/(cdn\.)?pixabay\.com\//.test(r.img || '')) r = Object.assign({}, r, { img: '/api/img?u=' + encodeURIComponent(r.img) });   // older saved/cached rows
+      if (!/^\/api\/img\?u=/.test(r.img || '')) return;
       let h = 7; for (let k = 0; k < r.id.length; k++) h = (h * 31 + r.id.charCodeAt(k)) >>> 0;
       const p = Object.assign({}, r, { alt: r.name, brand: (BRANDS[r.cat] || BRANDS.Home)[h % 4], order: PRODUCTS.length, live: true });
       PRODUCTS.push(p); BY_ID.set(p.id, p); added++;
@@ -829,7 +831,7 @@
     const seq = ++liveSeq;
     emptyMsg.textContent = 'Searching for “' + q + '”…';
     try {
-      const ck = 'live2|' + q;
+      const ck = 'live3|' + q;
       let rows = store.cache.get(ck);
       if (!rows) {
         const { data } = await getJSON(config.SEARCH_ENDPOINT + '?q=' + encodeURIComponent(q), { timeout: config.LIVE_TIMEOUT_MS });
@@ -1277,10 +1279,10 @@
   const asstHit = (h, t) => t.length < 3 ? (' ' + h + ' ').indexOf(' ' + t + ' ') !== -1 : (h.indexOf(t) !== -1 || h.indexOf(asstStem(t)) !== -1);
   function asstFind(q) {
     let s = q.toLowerCase().replace(/(\d),(?=\d{3}\b)/g, '$1'), max = null, min = null, cat = '', m;
-    const num = (v, k) => +v * (k ? 1000 : 1), CUR = '(?:rs\\.?|inr|₹)?\\s*';
-    if ((m = s.match(new RegExp('\\bbetween\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?\\s*(?:and|to|-)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?')))) { min = num(m[1], m[2]); max = num(m[3], m[4]); if (min > max) { const t = min; min = max; max = t; } s = s.replace(m[0], ' '); }
-    if (max == null && (m = s.match(new RegExp('\\b(?:under|below|less than|upto|up to|within|maximum|max)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?\\b')))) { max = num(m[1], m[2]); s = s.replace(m[0], ' '); }
-    if (min == null && (m = s.match(new RegExp('\\b(?:above|over|more than|minimum|min)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?\\b')))) { min = num(m[1], m[2]); s = s.replace(m[0], ' '); }
+    const num = (v, k) => +v * (!k ? 1 : k === 'k' ? 1000 : /^cr/.test(k) ? 10000000 : 100000), CUR = '(?:rs\\.?|inr|₹)?\\s*';
+    if ((m = s.match(new RegExp('\\bbetween\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?\\s*(?:and|to|-)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?')))) { min = num(m[1], m[2]); max = num(m[3], m[4]); if (min > max) { const t = min; min = max; max = t; } s = s.replace(m[0], ' '); }
+    if (max == null && (m = s.match(new RegExp('\\b(?:under|below|less than|upto|up to|within|maximum|max)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?\\b')))) { max = num(m[1], m[2]); s = s.replace(m[0], ' '); }
+    if (min == null && (m = s.match(new RegExp('\\b(?:above|over|more than|minimum|min)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?\\b')))) { min = num(m[1], m[2]); s = s.replace(m[0], ' '); }
     const rate = /top rated|best rated|highly rated|4\s*\+|4 stars?/.test(s) ? 4 : 0, cheap = /cheap|lowest|budget/.test(s), deals = /deal|discount|offer|sale/.test(s);
     const toks = s.replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !/^\d+$/.test(w) && !STOP.has(w) && !/^(deal|deals|discount|offer|sale|budget|lowest)$/.test(w) && !(CATWORDS[w] && (cat = CATWORDS[w])));
     const pool = PRODUCTS.filter(p => p.stock > 0 && (max == null || p.price <= max) && (min == null || p.price >= min) && p.rating >= rate && (!cat || p.cat === cat))

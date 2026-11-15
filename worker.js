@@ -18,7 +18,7 @@ const PEOPLE = ['man', 'woman', 'girl', 'boy', 'people', 'child', 'children', 'b
 
 /* Known products: [pattern, display name, category, min INR, max INR]. Anything else is classified by Gemini. */
 const PRICES = [
-  [/\b(tv|tvs|television|televisions|smart tv|led tv|oled)\b/, 'Smart TV', 'Electronics', 12999, 64999, { pq: 'television set', ban: 'tower antenna broadcast berlin architecture skyline city building clock vintage retro old antique crt static noise show movie cinema film news studio' }],
+  [/\b(tv|tvs|television|televisions|smart tv|led tv|oled)\b/, 'Smart TV', 'Electronics', 12999, 64999, { pq: 'flat screen tv', ban: 'tower antenna broadcast berlin architecture skyline city building clock', soft: 'vintage retro old antique crt static noise show movie cinema film news studio' }],
   [/\b(fridge|refrigerator)s?\b/, 'Refrigerator', 'Electronics', 13999, 54999],
   [/\bwashing machines?\b/, 'Washing Machine', 'Electronics', 11999, 42999],
   [/\b(ac|air conditioner)s?\b/, 'Air Conditioner', 'Electronics', 28999, 59999],
@@ -109,18 +109,41 @@ async function handlePixabay(request, env) {
 }
 
 /* ---------------- Gemini ---------------- */
-async function gemini(env, body) {
+/* Gemini call with timeouts. Tries: configured model, then -latest aliases; each with "minimal thinking" first
+   (3.x models otherwise think for a long time), then without thinkingConfig if the API rejects it. */
+async function gemini(env, body, opts = {}) {
   if (!env.GEMINI_API_KEY) throw Object.assign(new Error('GEMINI_API_KEY is not set'), { status: 500 });
-  let res;
-  for (const model of [env.GEMINI_MODEL || DEFAULT_MODEL, FALLBACK_MODEL]) {
-    res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY }, body: JSON.stringify(body)
-    });
-    if (res.status !== 404) break;                 // unknown/retired model name: try the next one
+  const perAttempt = opts.attemptMs || 12000, deadline = Date.now() + (opts.totalMs || 28000);
+  const models = opts.fast ? [env.GEMINI_MODEL || DEFAULT_MODEL, FALLBACK_MODEL] : [env.GEMINI_MODEL || DEFAULT_MODEL, FALLBACK_MODEL, 'gemini-flash-lite-latest'];
+  let last = 'no attempt';
+  for (const model of models) {
+    for (const think of [{ thinkingLevel: 'minimal' }, null]) {
+      if (Date.now() > deadline) throw Object.assign(new Error('Gemini timed out (' + last + ')'), { status: 504 });
+      const b = { ...body, generationConfig: { ...body.generationConfig, ...(think ? { thinkingConfig: think } : {}) } };
+      try {
+        const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+          body: JSON.stringify(b), signal: AbortSignal.timeout(perAttempt)
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const text = ((((data.candidates || [])[0] || {}).content || {}).parts || []).map(x => x.text || '').join('');
+          if (text) return text;
+          last = model + ' returned no text';
+          continue;
+        }
+        let msg = ''; try { msg = (await res.json()).error.message || ''; } catch (_) {}
+        last = model + ' HTTP ' + res.status + (msg ? ': ' + msg.slice(0, 160) : '');
+        if (res.status === 404) break;                          // unknown/retired model name: next model
+        if (res.status === 400 && think) continue;              // thinkingConfig not accepted: retry without it
+        if (res.status === 401 || res.status === 403 || res.status === 429) throw Object.assign(new Error('Gemini ' + last), { status: 502 });
+      } catch (e) {
+        if (e.status) throw e;
+        last = model + ' ' + (e.name === 'TimeoutError' ? 'timed out' : e.message);
+      }
+    }
   }
-  if (!res.ok) throw Object.assign(new Error('Gemini HTTP ' + res.status), { status: 502 });
-  const data = await res.json();
-  return (((data.candidates || [])[0] || {}).content || {}).parts?.map(x => x.text || '').join('') || '';
+  throw Object.assign(new Error('Gemini failed: ' + last), { status: 502 });
 }
 
 const ASSISTANT_SYSTEM =
@@ -143,7 +166,7 @@ async function handleAssistant(request, env) {
   const text = await gemini(env, {
     systemInstruction: { parts: [{ text: ASSISTANT_SYSTEM }] },
     contents,
-    generationConfig: { temperature: 0.4, maxOutputTokens: 1500, responseMimeType: 'application/json' }
+    generationConfig: { temperature: 0.4, maxOutputTokens: 1200, responseMimeType: 'application/json' }
   });
   return json({ text });
 }
@@ -154,7 +177,7 @@ async function profileFor(env, q) {
   for (const [re, name, cat, min, max, extra] of PRICES) {
     if (!re.test(low)) continue;
     const alts = ((re.source.match(/\(([^)]*)\)/) || [, ''])[1]).split('|').join(' ');     // synonyms: "tv|television|..." all count as the same product
-    return { name, cat, min, max, pq: (extra && extra.pq) || q, alts, ban: (extra && extra.ban) || '' };
+    return { name, cat, min, max, pq: (extra && extra.pq) || q, alts, ban: (extra && extra.ban) || '', soft: (extra && extra.soft) || '' };
   }
   if (env.GEMINI_API_KEY) {                       // unknown word: let Gemini classify it, and also translate non-English words
     try {
@@ -173,49 +196,61 @@ async function profileFor(env, q) {
   return { name: titleCase(q), cat: 'Home', min: 499, max: 2999, pq: q };
 }
 
-function buildProducts(prof, q, hits) {
+function toProduct(prof, q, h) {
+  const k = hash(String(h.id));
+  const raw = prof.min + (prof.max - prof.min) * ((k % 100) / 99);
+  const step = raw >= 10000 ? 500 : raw >= 1000 ? 100 : 10;
+  const price = Math.max(9, Math.round(raw / step) * step - 1);
+  const name = ADJ[k % ADJ.length] + ' ' + prof.name;
+  return {
+    id: 'live-' + h.id, cat: prof.cat, name, title: name, price,
+    was: k % 3 === 0 ? Math.round(price * 1.3 / 10) * 10 - 1 : undefined,
+    desc: 'Popular pick for "' + q + '". Photo from Pixabay; sample listing.',
+    img: '/api/img?u=' + encodeURIComponent(h.webformatURL), credit: { user: h.user, page: h.pageURL },
+    rating: +(3.8 + (k % 12) / 10).toFixed(1), rcount: 30 + (k >>> 3) % 1800, stock: k % 13 === 0 ? 3 : 25,
+    tags: q + ' ' + prof.name.toLowerCase()
+  };
+}
+
+/* Three passes, strictest first, so a search never comes back empty just because the filters were too picky:
+   1) product word ends a tag, no hard/soft banned subjects, no people  2) drop the soft bans  3) drop the people filter */
+function buildProducts(prof, q, hits, stages) {
   const words = new Set((prof.pq + ' ' + q + ' ' + (prof.alts || '')).toLowerCase().split(/\s+/).filter(w => w.length > 1).map(stem));
-  const bans = new Set(String(prof.ban || '').split(/\s+/).filter(Boolean));
-  const seen = new Set(), out = [];
+  const hard = new Set(String(prof.ban || '').split(/\s+/).filter(Boolean));
+  const soft = new Set(String(prof.soft || '').split(/\s+/).filter(Boolean));
+  const cands = [], seen = new Set();
   for (const h of hits) {
+    if (!pixabayImageOk(h.webformatURL) || seen.has(h.id)) continue; seen.add(h.id);
     const tags = String(h.tags || '').toLowerCase().split(/,\s*/);
-    const headNoun = tags.some(t => { const parts = t.trim().split(/\s+/); return words.has(stem(parts[parts.length - 1])); });
-    if (!headNoun) continue;                                                // some tag must name the product itself ("tv tower" does not)
-    if (bans.size && tags.join(' ').split(/\s+/).some(w => bans.has(w))) continue;
-    if (tags.some(t => PEOPLE.includes(t))) continue;                       // product shots only
-    if (!pixabayImageOk(h.webformatURL)) continue;
-    if (seen.has(h.id)) continue; seen.add(h.id);
-    const k = hash(String(h.id));
-    const raw = prof.min + (prof.max - prof.min) * ((k % 100) / 99);
-    const step = raw >= 10000 ? 500 : raw >= 1000 ? 100 : 10;
-    const price = Math.max(9, Math.round(raw / step) * step - 1);
-    const name = ADJ[k % ADJ.length] + ' ' + prof.name;
-    out.push({
-      id: 'live-' + h.id, cat: prof.cat, name, title: name, price,
-      was: k % 3 === 0 ? Math.round(price * 1.3 / 10) * 10 - 1 : undefined,
-      desc: 'Popular pick for "' + q + '". Photo from Pixabay; sample listing.',
-      img: '/api/img?u=' + encodeURIComponent(h.webformatURL), credit: { user: h.user, page: h.pageURL },
-      rating: +(3.8 + (k % 12) / 10).toFixed(1), rcount: 30 + (k >>> 3) % 1800, stock: k % 13 === 0 ? 3 : 25,
-      tags: q + ' ' + prof.name.toLowerCase()
-    });
-    if (out.length >= 24) break;
+    const head = tags.some(t => { const p = t.trim().split(/\s+/); return words.has(stem(p[p.length - 1])); });     // "tv tower" does not count as a TV
+    if (!head) continue;
+    const tw = tags.join(' ').split(/\s+/);
+    cands.push({ h, hard: tw.some(w => hard.has(w)), soft: tw.some(w => soft.has(w)), people: tags.some(t => PEOPLE.includes(t)) });
   }
-  return out;
+  const passes = [c => !c.hard && !c.soft && !c.people, c => !c.hard && !c.people, c => !c.hard];
+  for (let i = 0; i < passes.length; i++) {
+    const out = cands.filter(passes[i]).slice(0, 24).map(c => toProduct(prof, q, c.h));
+    if (out.length >= 3 || (i === passes.length - 1 && out.length)) { if (stages) { stages.pass = i + 1; stages.candidates = cands.length; } return out; }
+  }
+  if (stages) { stages.pass = 0; stages.candidates = cands.length; }
+  return [];
 }
 
 /* Ask Gemini which candidate photos (judged by their tags) really show the product. Falls back to all candidates. */
-async function vetWithGemini(env, prof, q, products, hitsById) {
-  if (!env.GEMINI_API_KEY || products.length < 2) return products;
+async function vetWithGemini(env, prof, q, products, hitsById, stages) {
+  if (!env.GEMINI_API_KEY || products.length < 4) return products.slice(0, 8);
   try {
     const list = products.map(p => p.id.slice(5) + ': ' + (hitsById.get(p.id.slice(5)) || '')).join('\n');
     const txt = await gemini(env, {
-      systemInstruction: { parts: [{ text: 'You check stock photos for an online store. Given a product and photo tag lists, keep only photos that very likely show the product itself as the main subject. Reject landmarks, buildings, cities, people, screenshots, vintage/retro items, and anything where the product is only incidental. Reply ONLY as JSON: {"ids": ["<id>", ...]} (best first, at most 8; empty if none qualify).' }] },
+      systemInstruction: { parts: [{ text: 'You check stock photos for an online store. Given a product and photo tag lists, keep only photos that very likely show the product itself as the main subject. Reject landmarks, buildings, cities, people, screenshots, vintage/retro items, and anything where the product is only incidental. Reply ONLY as JSON: {"ids": ["<id>", ...]} (best first, at most 8).' }] },
       contents: [{ role: 'user', parts: [{ text: 'Product: ' + prof.name + ' (shopper searched "' + q + '")\nPhotos (id: tags):\n' + list }] }],
       generationConfig: { temperature: 0, maxOutputTokens: 600, responseMimeType: 'application/json' }
-    });
+    }, { fast: true, attemptMs: 6000, totalMs: 9000 });
     const ids = new Set((JSON.parse(txt.replace(/```json|```/g, '').trim()).ids || []).map(String));
-    return products.filter(p => ids.has(p.id.slice(5))).slice(0, 8);
-  } catch (_) { return products.slice(0, 8); }
+    const kept = products.filter(p => ids.has(p.id.slice(5))).slice(0, 8);
+    if (stages) stages.vet = kept.length;
+    return kept.length >= 2 ? kept : products.slice(0, 6);        // vet found (almost) nothing: trust the tag filter instead of showing no results
+  } catch (e) { if (stages) stages.vetError = String(e.message || e).slice(0, 120); return products.slice(0, 8); }
 }
 
 async function handleImage(request, env) {
@@ -237,7 +272,7 @@ async function handleImage(request, env) {
 async function handleSearch(request, env, ctx) {
   const q = cleanQuery(new URL(request.url).searchParams.get('q'));
   if (q.length < 2) return json({ products: [] });
-  const cacheKey = new Request('https://cache.pixelcart.internal/search?q=' + encodeURIComponent(q.toLowerCase()));
+  const cacheKey = new Request('https://cache.pixelcart.internal/search3?q=' + encodeURIComponent(q.toLowerCase()));
   const cache = caches.default;
   const hit = await cache.match(cacheKey);
   if (hit) return new Response(hit.body, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=3600' } });
@@ -245,9 +280,10 @@ async function handleSearch(request, env, ctx) {
   const prof = await profileFor(env, q);
   if (!prof) return json({ products: [], note: 'not a shoppable product' });
   const data = await pixabay(env, { q: prof.pq, lang: 'en', image_type: 'photo', safesearch: 'true', order: 'popular', per_page: '60', min_width: '600', min_height: '400' });
+  const stages = { hits: (data.hits || []).length };
   const hitsById = new Map((data.hits || []).map(h => [String(h.id), h.tags]));
-  const products = await vetWithGemini(env, prof, q, buildProducts(prof, q, data.hits || []), hitsById);
-  const res = json({ products, query: q }, 200, { 'Cache-Control': 'public, max-age=3600' });
+  const products = await vetWithGemini(env, prof, q, buildProducts(prof, q, data.hits || [], stages), hitsById, stages);
+  const res = json({ products, query: q, stages }, 200, { 'Cache-Control': 'public, max-age=3600' });
   if (products.length) ctx.waitUntil(cache.put(cacheKey, new Response(JSON.stringify({ products, query: q }), { headers: { 'Cache-Control': 'public, max-age=86400' } })));
   return res;
 }
@@ -263,7 +299,17 @@ export default {
       if (url.pathname === '/api/img') return await handleImage(request, env);
       if (url.pathname === '/api/search') return await handleSearch(request, env, ctx);
       if (url.pathname === '/api/assistant') return await handleAssistant(request, env);
-      if (url.pathname === '/api/health') return json({ ok: true, pixabay: !!env.PIXABAY_KEY, gemini: !!env.GEMINI_API_KEY });
+      if (url.pathname === '/api/health') {
+        const out = { ok: true, pixabay: !!env.PIXABAY_KEY, gemini: !!env.GEMINI_API_KEY };
+        if (url.searchParams.get('deep')) {
+          const t0 = Date.now();
+          try { const d = await pixabay(env, { q: 'television', per_page: '3' }); out.pixabayTest = 'ok, ' + d.total + ' results'; } catch (e) { out.pixabayTest = 'FAILED: ' + e.message; }
+          const t1 = Date.now();
+          try { const t = await gemini(env, { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word: pong' }] }], generationConfig: { maxOutputTokens: 20 } }, { attemptMs: 10000, totalMs: 20000 }); out.geminiTest = 'ok: ' + t.trim().slice(0, 30); } catch (e) { out.geminiTest = 'FAILED: ' + e.message; }
+          out.ms = { pixabay: t1 - t0, gemini: Date.now() - t1 };
+        }
+        return json(out);
+      }
       return json({ error: 'not found' }, 404);
     } catch (e) {
       const status = e.status || 502;
