@@ -82,7 +82,8 @@
   /* An image URL is usable only if it is https and on the allowlist. */
   function isAllowedImageUrl(url) {
     try {
-      const u = new URL(url);
+      const u = new URL(url, w.location.origin);
+      if (u.origin === w.location.origin && u.pathname === '/api/img') return true;       // photos served through our Worker
       return u.protocol === 'https:' && config.ALLOWED_IMAGE_HOSTS.indexOf(u.hostname) !== -1;
     } catch (_) { return false; }
   }
@@ -306,11 +307,11 @@
 
   /* Live listing: products created from a search the built-in catalogue cannot answer (see worker.js /api/search).
      They join PRODUCTS/BY_ID, so cart, wishlist, quick view and compare work on them like on any other item. */
-  const DYN_KEY = 'ss.live.v1';
+  const DYN_KEY = 'ss.live.v2';                     // v2: older saved results had off-topic photos
   function addLive(rows) {
     let added = 0;
     (Array.isArray(rows) ? rows : []).forEach(r => {
-      if (!r || BY_ID.has(r.id) || !CAT_LABEL[r.cat] || !/^https:\/\/(cdn\.)?pixabay\.com\//.test(r.img || '')) return;
+      if (!r || BY_ID.has(r.id) || !CAT_LABEL[r.cat] || !/^\/api\/img\?u=/.test(r.img || '')) return;
       let h = 7; for (let k = 0; k < r.id.length; k++) h = (h * 31 + r.id.charCodeAt(k)) >>> 0;
       const p = Object.assign({}, r, { alt: r.name, brand: (BRANDS[r.cat] || BRANDS.Home)[h % 4], order: PRODUCTS.length, live: true });
       PRODUCTS.push(p); BY_ID.set(p.id, p); added++;
@@ -493,6 +494,9 @@
     return p;
   }
 
+  /* Pixabay answers direct image links with HTTP 429 under load, so photos are fetched by the Worker (cached) instead. */
+  const viaWorker = u => '/api/img?u=' + encodeURIComponent(u);
+
   async function pxBest(product, used, accept) {
     const prof = product.search;
     const foreign = foreignOf(prof);
@@ -507,7 +511,7 @@
       used.add(r.pick.hit.id);
       trace.push('"' + q + '": picked #' + r.pick.hit.id + ' (score ' + r.pick.score.toFixed(1) + ', tags: ' + r.pick.hit.tags + ')');
       return {
-        source: 'pixabay', url: r.pick.hit.webformatURL || r.pick.hit.largeImageURL, fit: 'cover', alt: product.alt,
+        source: 'pixabay', url: viaWorker(r.pick.hit.webformatURL || r.pick.hit.largeImageURL), fit: 'cover', alt: product.alt,
         credit: { user: r.pick.hit.user, page: r.pick.hit.pageURL },
         meta: { id: r.pick.hit.id, tags: r.pick.hit.tags, query: q }, trace: trace
       };
@@ -518,7 +522,7 @@
         const r = pickPixabay(hits, prof, foreign, new Set(), accept);
         if (!r.pick) continue;
         trace.push('"' + q + '": reused #' + r.pick.hit.id);
-        return { source: 'pixabay', url: r.pick.hit.webformatURL || r.pick.hit.largeImageURL, fit: 'cover', alt: product.alt,
+        return { source: 'pixabay', url: viaWorker(r.pick.hit.webformatURL || r.pick.hit.largeImageURL), fit: 'cover', alt: product.alt,
           credit: { user: r.pick.hit.user, page: r.pick.hit.pageURL }, meta: { id: r.pick.hit.id, tags: r.pick.hit.tags, query: q }, trace: trace };
       }
     }
@@ -614,6 +618,7 @@
     const trace = [];
     if (product.img && usable(product.img)) return { source: 'pixabay', url: product.img, fit: 'cover', alt: product.alt || product.name, credit: product.credit, trace: ['live listing photo'] };
     if (product.keep && usable(product.fallback)) return { source: 'static', url: product.fallback, fit: 'cover', alt: product.alt, trace: ['original photo link kept'] };
+    if (!product.keep && px.reason === 'rate limit' && Date.now() < px.pausedUntil) await new Promise(r => setTimeout(r, Math.min(px.pausedUntil - Date.now(), 65000) + 250));   // wait out the limit instead of giving up on this photo
     if (pxAvailable()) {
       try {
         const r = await pxBest(product, usedIds.pixabay, usable);
@@ -824,7 +829,7 @@
     const seq = ++liveSeq;
     emptyMsg.textContent = 'Searching for “' + q + '”…';
     try {
-      const ck = 'live|' + q;
+      const ck = 'live2|' + q;
       let rows = store.cache.get(ck);
       if (!rows) {
         const { data } = await getJSON(config.SEARCH_ENDPOINT + '?q=' + encodeURIComponent(q), { timeout: config.LIVE_TIMEOUT_MS });

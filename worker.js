@@ -10,14 +10,15 @@
      GEMINI_API_KEY   your Google AI Studio key
    Optional plain variable: GEMINI_MODEL (default gemini-2.5-flash), ALLOWED_ORIGINS (comma list of extra origins). */
 
-const DEFAULT_MODEL = 'gemini-2.5-flash';
+const DEFAULT_MODEL = 'gemini-3.8-flash';          // gemini-2.5-* is retired for new API keys (404)
+const FALLBACK_MODEL = 'gemini-flash-latest';
 const ADJ = ['Aura', 'Nova', 'Zenith', 'Lumen', 'Ember', 'Onyx', 'Solace', 'Vertex', 'Haven', 'Pulse', 'Echo', 'Drift'];
 const CATS = ['Fashion', 'Electronics', 'Home', 'Beauty', 'Crafts'];
 const PEOPLE = ['man', 'woman', 'girl', 'boy', 'people', 'child', 'children', 'baby', 'portrait', 'model', 'face', 'couple', 'family'];
 
 /* Known products: [pattern, display name, category, min INR, max INR]. Anything else is classified by Gemini. */
 const PRICES = [
-  [/\b(tv|tvs|television|televisions|smart tv|led tv|oled)\b/, 'Smart TV', 'Electronics', 12999, 64999],
+  [/\b(tv|tvs|television|televisions|smart tv|led tv|oled)\b/, 'Smart TV', 'Electronics', 12999, 64999, { pq: 'television set', ban: 'tower antenna broadcast berlin architecture skyline city building clock vintage retro old antique crt static noise show movie cinema film news studio' }],
   [/\b(fridge|refrigerator)s?\b/, 'Refrigerator', 'Electronics', 13999, 54999],
   [/\bwashing machines?\b/, 'Washing Machine', 'Electronics', 11999, 42999],
   [/\b(ac|air conditioner)s?\b/, 'Air Conditioner', 'Electronics', 28999, 59999],
@@ -74,6 +75,10 @@ function originAllowed(request, env) {
   return String(env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean).includes(origin);
 }
 
+function pixabayImageOk(u) {
+  try { const x = new URL(u); return x.protocol === 'https:' && (x.hostname === 'pixabay.com' || x.hostname === 'cdn.pixabay.com'); } catch (_) { return false; }
+}
+
 function cleanQuery(raw) {
   return String(raw || '').normalize('NFKC').replace(/[^\p{L}\p{N} \-]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
 }
@@ -106,10 +111,13 @@ async function handlePixabay(request, env) {
 /* ---------------- Gemini ---------------- */
 async function gemini(env, body) {
   if (!env.GEMINI_API_KEY) throw Object.assign(new Error('GEMINI_API_KEY is not set'), { status: 500 });
-  const model = env.GEMINI_MODEL || DEFAULT_MODEL;
-  const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY }, body: JSON.stringify(body)
-  });
+  let res;
+  for (const model of [env.GEMINI_MODEL || DEFAULT_MODEL, FALLBACK_MODEL]) {
+    res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY }, body: JSON.stringify(body)
+    });
+    if (res.status !== 404) break;                 // unknown/retired model name: try the next one
+  }
   if (!res.ok) throw Object.assign(new Error('Gemini HTTP ' + res.status), { status: 502 });
   const data = await res.json();
   return (((data.candidates || [])[0] || {}).content || {}).parts?.map(x => x.text || '').join('') || '';
@@ -135,7 +143,7 @@ async function handleAssistant(request, env) {
   const text = await gemini(env, {
     systemInstruction: { parts: [{ text: ASSISTANT_SYSTEM }] },
     contents,
-    generationConfig: { temperature: 0.4, maxOutputTokens: 700, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } }
+    generationConfig: { temperature: 0.4, maxOutputTokens: 1500, responseMimeType: 'application/json' }
   });
   return json({ text });
 }
@@ -143,23 +151,23 @@ async function handleAssistant(request, env) {
 /* ---------------- Live listing for any search term ---------------- */
 async function profileFor(env, q) {
   const low = q.toLowerCase();
-  for (const [re, name, cat, min, max] of PRICES) {
+  for (const [re, name, cat, min, max, extra] of PRICES) {
     if (!re.test(low)) continue;
     const alts = ((re.source.match(/\(([^)]*)\)/) || [, ''])[1]).split('|').join(' ');     // synonyms: "tv|television|..." all count as the same product
-    return { name, cat, min, max, pq: q, alts };
+    return { name, cat, min, max, pq: (extra && extra.pq) || q, alts, ban: (extra && extra.ban) || '' };
   }
   if (env.GEMINI_API_KEY) {                       // unknown word: let Gemini classify it, and also translate non-English words
     try {
       const txt = await gemini(env, {
-        systemInstruction: { parts: [{ text: 'You classify a shopper\'s search for an Indian online store. Reply ONLY as JSON: {"product": true|false, "name": "singular product name in English, Title Case, max 3 words", "category": "Fashion|Electronics|Home|Beauty|Crafts", "minInr": number, "maxInr": number, "photoQuery": "2-3 English words for a stock-photo search"}. "product" is false for anything that is not a normal physical retail product (people, places, adult, weapons, drugs, abstract words). Prices are realistic Indian retail prices in rupees.' }] },
+        systemInstruction: { parts: [{ text: 'You classify a shopper\'s search for an Indian online store. Reply ONLY as JSON: {"product": true|false, "name": "singular product name in English, Title Case, max 3 words", "category": "Fashion|Electronics|Home|Beauty|Crafts", "minInr": number, "maxInr": number, "photoQuery": "2-3 English words for a stock-photo search", "avoid": "up to 8 lowercase words that appear in tags of WRONG photos for this search, e.g. landmarks, places, people"}. "product" is false for anything that is not a normal physical retail product (people, places, adult, weapons, drugs, abstract words). Prices are realistic Indian retail prices in rupees.' }] },
         contents: [{ role: 'user', parts: [{ text: q }] }],
-        generationConfig: { temperature: 0, maxOutputTokens: 200, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } }
+        generationConfig: { temperature: 0, maxOutputTokens: 600, responseMimeType: 'application/json' }
       });
       const o = JSON.parse(txt.replace(/```json|```/g, '').trim());
       if (o.product === false) return null;
       let min = Math.max(49, Math.round(+o.minInr) || 0), max = Math.min(500000, Math.round(+o.maxInr) || 0);
       if (!(min > 0 && max > min)) { min = 499; max = 2999; }
-      return { name: titleCase(String(o.name || q).slice(0, 40)), cat: CATS.includes(o.category) ? o.category : 'Home', min, max, pq: cleanQuery(o.photoQuery) || q };
+      return { name: titleCase(String(o.name || q).slice(0, 40)), cat: CATS.includes(o.category) ? o.category : 'Home', min, max, pq: cleanQuery(o.photoQuery) || q, ban: String(o.avoid || '').toLowerCase().replace(/[^a-z ,]/g, ' ').replace(/,/g, ' ') };
     } catch (_) { /* fall through to the default */ }
   }
   return { name: titleCase(q), cat: 'Home', min: 499, max: 2999, pq: q };
@@ -167,13 +175,15 @@ async function profileFor(env, q) {
 
 function buildProducts(prof, q, hits) {
   const words = new Set((prof.pq + ' ' + q + ' ' + (prof.alts || '')).toLowerCase().split(/\s+/).filter(w => w.length > 1).map(stem));
+  const bans = new Set(String(prof.ban || '').split(/\s+/).filter(Boolean));
   const seen = new Set(), out = [];
   for (const h of hits) {
     const tags = String(h.tags || '').toLowerCase().split(/,\s*/);
-    const tagWords = tags.join(' ').split(/\s+/).map(stem);
-    if (!tagWords.some(w => words.has(w))) continue;                        // photo must actually be about the search
+    const headNoun = tags.some(t => { const parts = t.trim().split(/\s+/); return words.has(stem(parts[parts.length - 1])); });
+    if (!headNoun) continue;                                                // some tag must name the product itself ("tv tower" does not)
+    if (bans.size && tags.join(' ').split(/\s+/).some(w => bans.has(w))) continue;
     if (tags.some(t => PEOPLE.includes(t))) continue;                       // product shots only
-    if (!/^https:\/\/(cdn\.)?pixabay\.com\//.test(h.webformatURL || '')) continue;
+    if (!pixabayImageOk(h.webformatURL)) continue;
     if (seen.has(h.id)) continue; seen.add(h.id);
     const k = hash(String(h.id));
     const raw = prof.min + (prof.max - prof.min) * ((k % 100) / 99);
@@ -184,13 +194,44 @@ function buildProducts(prof, q, hits) {
       id: 'live-' + h.id, cat: prof.cat, name, title: name, price,
       was: k % 3 === 0 ? Math.round(price * 1.3 / 10) * 10 - 1 : undefined,
       desc: 'Popular pick for "' + q + '". Photo from Pixabay; sample listing.',
-      img: h.webformatURL, credit: { user: h.user, page: h.pageURL },
-      rating: +(3.8 + (k % 12) / 10).toFixed(1), rcount: 30 + (k >> 3) % 1800, stock: k % 13 === 0 ? 3 : 25,
+      img: '/api/img?u=' + encodeURIComponent(h.webformatURL), credit: { user: h.user, page: h.pageURL },
+      rating: +(3.8 + (k % 12) / 10).toFixed(1), rcount: 30 + (k >>> 3) % 1800, stock: k % 13 === 0 ? 3 : 25,
       tags: q + ' ' + prof.name.toLowerCase()
     });
-    if (out.length >= 8) break;
+    if (out.length >= 24) break;
   }
   return out;
+}
+
+/* Ask Gemini which candidate photos (judged by their tags) really show the product. Falls back to all candidates. */
+async function vetWithGemini(env, prof, q, products, hitsById) {
+  if (!env.GEMINI_API_KEY || products.length < 2) return products;
+  try {
+    const list = products.map(p => p.id.slice(5) + ': ' + (hitsById.get(p.id.slice(5)) || '')).join('\n');
+    const txt = await gemini(env, {
+      systemInstruction: { parts: [{ text: 'You check stock photos for an online store. Given a product and photo tag lists, keep only photos that very likely show the product itself as the main subject. Reject landmarks, buildings, cities, people, screenshots, vintage/retro items, and anything where the product is only incidental. Reply ONLY as JSON: {"ids": ["<id>", ...]} (best first, at most 8; empty if none qualify).' }] },
+      contents: [{ role: 'user', parts: [{ text: 'Product: ' + prof.name + ' (shopper searched "' + q + '")\nPhotos (id: tags):\n' + list }] }],
+      generationConfig: { temperature: 0, maxOutputTokens: 600, responseMimeType: 'application/json' }
+    });
+    const ids = new Set((JSON.parse(txt.replace(/```json|```/g, '').trim()).ids || []).map(String));
+    return products.filter(p => ids.has(p.id.slice(5))).slice(0, 8);
+  } catch (_) { return products.slice(0, 8); }
+}
+
+async function handleImage(request, env) {
+  const ref = request.headers.get('Referer');
+  if (ref) { try { if (new URL(ref).host !== new URL(request.url).host && !/^(localhost|127\.0\.0\.1)$/.test(new URL(ref).hostname)) return new Response('forbidden', { status: 403 }); } catch (_) {} }
+  const target = new URL(request.url).searchParams.get('u') || '';
+  if (!pixabayImageOk(target)) return new Response('bad image url', { status: 400 });
+  let up;
+  for (let i = 0; i < 3; i++) {                        // Pixabay answers 429 when it is hit too fast: wait and retry
+    up = await fetch(target, { cf: { cacheEverything: true, cacheTtl: 2592000 }, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PixelcartImageProxy/1.0)' } });
+    if (up.status !== 429) break;
+    await new Promise(r => setTimeout(r, 400 * (i + 1)));
+  }
+  const type = up.headers.get('Content-Type') || '';
+  if (!up.ok || !type.startsWith('image/')) return new Response('image unavailable', { status: 502, headers: { 'Cache-Control': 'no-store' } });
+  return new Response(up.body, { headers: { 'Content-Type': type, 'Cache-Control': 'public, max-age=2592000, immutable' } });
 }
 
 async function handleSearch(request, env, ctx) {
@@ -203,8 +244,9 @@ async function handleSearch(request, env, ctx) {
 
   const prof = await profileFor(env, q);
   if (!prof) return json({ products: [], note: 'not a shoppable product' });
-  const data = await pixabay(env, { q: prof.pq, lang: 'en', image_type: 'photo', safesearch: 'true', order: 'popular', per_page: '40', min_width: '600', min_height: '450' });
-  const products = buildProducts(prof, q, data.hits || []);
+  const data = await pixabay(env, { q: prof.pq, lang: 'en', image_type: 'photo', safesearch: 'true', order: 'popular', per_page: '60', min_width: '600', min_height: '400' });
+  const hitsById = new Map((data.hits || []).map(h => [String(h.id), h.tags]));
+  const products = await vetWithGemini(env, prof, q, buildProducts(prof, q, data.hits || []), hitsById);
   const res = json({ products, query: q }, 200, { 'Cache-Control': 'public, max-age=3600' });
   if (products.length) ctx.waitUntil(cache.put(cacheKey, new Response(JSON.stringify({ products, query: q }), { headers: { 'Cache-Control': 'public, max-age=86400' } })));
   return res;
@@ -215,9 +257,10 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request);
-    if (!originAllowed(request, env)) return json({ error: 'forbidden origin' }, 403);
+    if (url.pathname !== '/api/img' && !originAllowed(request, env)) return json({ error: 'forbidden origin' }, 403);
     try {
       if (url.pathname === '/api/pixabay') return await handlePixabay(request, env);
+      if (url.pathname === '/api/img') return await handleImage(request, env);
       if (url.pathname === '/api/search') return await handleSearch(request, env, ctx);
       if (url.pathname === '/api/assistant') return await handleAssistant(request, env);
       if (url.pathname === '/api/health') return json({ ok: true, pixabay: !!env.PIXABAY_KEY, gemini: !!env.GEMINI_API_KEY });
