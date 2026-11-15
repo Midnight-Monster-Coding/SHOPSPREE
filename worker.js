@@ -84,14 +84,23 @@ function cleanQuery(raw) {
 }
 
 /* ---------------- Pixabay ---------------- */
+/* Per-isolate memory cache: the Cache API does nothing on *.workers.dev, so this is what keeps repeat queries
+   from burning Pixabay's 100-requests-per-minute limit. On a 429 the last answer (even an old one) is served instead. */
+const PX_MEM = new Map();
 async function pixabay(env, params) {
   if (!env.PIXABAY_KEY) throw Object.assign(new Error('PIXABAY_KEY is not set'), { status: 500 });
   const u = new URL('https://pixabay.com/api/');
   Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
+  const mk = u.searchParams.toString(), now = Date.now(), c = PX_MEM.get(mk);
+  if (c && now - c.t < 3600e3) return c.d;
   u.searchParams.set('key', env.PIXABAY_KEY);
   const res = await fetch(u.toString(), { cf: { cacheTtl: 86400, cacheEverything: true } });
-  if (!res.ok) throw Object.assign(new Error('Pixabay HTTP ' + res.status), { status: res.status === 429 ? 429 : 502, retry: res.headers.get('X-RateLimit-Reset') });
-  return res.json();
+  if (res.status === 429 && c) return c.d;
+  if (!res.ok) throw Object.assign(new Error('Pixabay HTTP ' + res.status + (res.status === 429 ? ' (rate limit: 100 requests/minute per key)' : '')), { status: res.status === 429 ? 429 : 502, retry: res.headers.get('X-RateLimit-Reset') });
+  const d = await res.json();
+  if (PX_MEM.size > 300) PX_MEM.delete(PX_MEM.keys().next().value);
+  PX_MEM.set(mk, { t: now, d });
+  return d;
 }
 
 /* Pass-through used by the existing photo pipeline: only whitelisted parameters, key added here. */
