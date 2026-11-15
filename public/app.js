@@ -16,19 +16,14 @@
 
   /* ======================================================================== 1. config */
   const config = {
-    /* Pixabay API key (https://pixabay.com/api/docs/). Paste it here, or run once in the console and reload:
-         localStorage.setItem('ss.pixabayKey', 'YOUR_KEY')
-       With no key, Pixabay is skipped and DummyJSON is used instead. */
-    PIXABAY_KEY: '58610936-6dc33d6283a5034e424844588',
-
-    /* AI shopping assistant (Google Gemini). The key sits in this file, so anyone who opens the page can read it:
-       restrict it to your website's address in Google Cloud, or move the call to a small server before going live. */
-    GEMINI_KEY: (w.PIXELCART_SECRETS && w.PIXELCART_SECRETS.GEMINI_KEY) || '',     // comes from config.local.js (git-ignored)
-    GEMINI_MODEL: 'gemini-2.5-flash',
-    GEMINI_ENDPOINT: 'https://generativelanguage.googleapis.com/v1beta/models/',
+    /* No API keys live in the browser. Pixabay and Gemini are called through the Cloudflare Worker (worker.js),
+       which holds PIXABAY_KEY and GEMINI_API_KEY as secrets. */
+    PIXABAY_ENDPOINT: '/api/pixabay',         // Pixabay proxy
+    SEARCH_ENDPOINT: '/api/search',           // live listing for searches the catalogue cannot answer (e.g. "tv")
+    AI_ENDPOINT: '/api/assistant',            // Gemini shopping assistant
     GEMINI_TIMEOUT_MS: 20000,
+    LIVE_TIMEOUT_MS: 15000,
 
-    PIXABAY_ENDPOINT: 'https://pixabay.com/api/',
     DUMMYJSON_BASE: 'https://dummyjson.com',
     CACHE_TTL_MS: 24 * 60 * 60 * 1000,      // Pixabay requires API responses to be cached for 24 hours
     REQUEST_TIMEOUT_MS: 4500,
@@ -38,19 +33,7 @@
     CART_KEY: 'shopspree.cart.v1',
 
     // Only these hosts may ever be used as an <img> source.
-    ALLOWED_IMAGE_HOSTS: ['pixabay.com', 'cdn.pixabay.com', 'cdn.dummyjson.com', 'images.unsplash.com'],
-
-    getGeminiKey() {
-      let key = config.GEMINI_KEY;
-      if (!key) { try { key = w.localStorage.getItem('ss.geminiKey') || ''; } catch (_) { key = ''; } }
-      return String(key).trim();
-    },
-    getPixabayKey() {
-      let key = config.PIXABAY_KEY;
-      if (!key) { try { key = w.localStorage.getItem('ss.pixabayKey') || ''; } catch (_) { key = ''; } }
-      key = String(key).trim();
-      return /^[A-Za-z0-9_-]{8,64}$/.test(key) ? key : '';
-    }
+    ALLOWED_IMAGE_HOSTS: ['pixabay.com', 'cdn.pixabay.com', 'cdn.dummyjson.com', 'images.unsplash.com']
   };
 
   /* ======================================================================== 2. log */
@@ -321,6 +304,25 @@
   const BANNER = { url: unsplash('1607082349566-187342175e2f'), alt: 'Sale tags and a red gift box with 50% off' };
   SS.catalog = { products: PRODUCTS, byId: BY_ID, CAT_LABEL: CAT_LABEL, BANNER: BANNER };
 
+  /* Live listing: products created from a search the built-in catalogue cannot answer (see worker.js /api/search).
+     They join PRODUCTS/BY_ID, so cart, wishlist, quick view and compare work on them like on any other item. */
+  const DYN_KEY = 'ss.live.v1';
+  function addLive(rows) {
+    let added = 0;
+    (Array.isArray(rows) ? rows : []).forEach(r => {
+      if (!r || BY_ID.has(r.id) || !CAT_LABEL[r.cat] || !/^https:\/\/(cdn\.)?pixabay\.com\//.test(r.img || '')) return;
+      let h = 7; for (let k = 0; k < r.id.length; k++) h = (h * 31 + r.id.charCodeAt(k)) >>> 0;
+      const p = Object.assign({}, r, { alt: r.name, brand: (BRANDS[r.cat] || BRANDS.Home)[h % 4], order: PRODUCTS.length, live: true });
+      PRODUCTS.push(p); BY_ID.set(p.id, p); added++;
+    });
+    return added;
+  }
+  function saveLive() {
+    const rows = PRODUCTS.filter(p => p.live).slice(-48).map(p => ({ id: p.id, cat: p.cat, name: p.name, title: p.title, price: p.price, was: p.was, desc: p.desc, img: p.img, credit: p.credit, rating: p.rating, rcount: p.rcount, stock: p.stock, tags: p.tags }));
+    try { store.set(DYN_KEY, JSON.stringify(rows)); } catch (_) {}
+  }
+  try { addLive(JSON.parse(store.get(DYN_KEY) || '[]')); } catch (_) {}
+
   /* ======================================================================== 7. relevance
      Pure functions: decide whether a photo may represent a product.
      A Pixabay photo is rejected when ANY of these is true:
@@ -447,9 +449,8 @@
   const pxInflight = new Map();
   const PX_KEEP = ['id', 'pageURL', 'type', 'tags', 'webformatURL', 'largeImageURL', 'imageWidth', 'imageHeight', 'user', 'likes', 'downloads'];
 
-  const pxAvailable = () => !!config.getPixabayKey() && Date.now() >= px.pausedUntil && w.navigator.onLine !== false;
+  const pxAvailable = () => Date.now() >= px.pausedUntil && w.navigator.onLine !== false;
   function pxWhy() {
-    if (!config.getPixabayKey()) return 'no API key set';
     if (w.navigator.onLine === false) return 'offline';
     if (Date.now() < px.pausedUntil) return 'paused: ' + px.reason;
     return 'available';
@@ -468,7 +469,6 @@
     if (pxInflight.has(cacheKey)) return pxInflight.get(cacheKey);
 
     const p = (async () => {
-      params.set('key', config.getPixabayKey());
       px.requests++;
       try {
         const { data } = await getJSON(config.PIXABAY_ENDPOINT + '?' + params.toString());
@@ -482,7 +482,7 @@
           const reset = e.headers && Number(e.headers.get('X-RateLimit-Reset'));
           pxPause('rate limit', (reset > 0 ? reset : 60) * 1000);
         } else if (e.status === 400 || e.status === 401 || e.status === 403) {
-          pxPause('API key rejected (HTTP ' + e.status + ')', 60 * 60 * 1000);
+          pxPause('API proxy refused the request (HTTP ' + e.status + ')', 10 * 60 * 1000);
         } else if (++px.failures >= 2) {
           pxPause(e.message, 60 * 1000);
         }
@@ -507,7 +507,7 @@
       used.add(r.pick.hit.id);
       trace.push('"' + q + '": picked #' + r.pick.hit.id + ' (score ' + r.pick.score.toFixed(1) + ', tags: ' + r.pick.hit.tags + ')');
       return {
-        source: 'pixabay', url: r.pick.hit.largeImageURL || r.pick.hit.webformatURL, fit: 'cover', alt: product.alt,
+        source: 'pixabay', url: r.pick.hit.webformatURL || r.pick.hit.largeImageURL, fit: 'cover', alt: product.alt,
         credit: { user: r.pick.hit.user, page: r.pick.hit.pageURL },
         meta: { id: r.pick.hit.id, tags: r.pick.hit.tags, query: q }, trace: trace
       };
@@ -518,7 +518,7 @@
         const r = pickPixabay(hits, prof, foreign, new Set(), accept);
         if (!r.pick) continue;
         trace.push('"' + q + '": reused #' + r.pick.hit.id);
-        return { source: 'pixabay', url: r.pick.hit.largeImageURL || r.pick.hit.webformatURL, fit: 'cover', alt: product.alt,
+        return { source: 'pixabay', url: r.pick.hit.webformatURL || r.pick.hit.largeImageURL, fit: 'cover', alt: product.alt,
           credit: { user: r.pick.hit.user, page: r.pick.hit.pageURL }, meta: { id: r.pick.hit.id, tags: r.pick.hit.tags, query: q }, trace: trace };
       }
     }
@@ -612,6 +612,7 @@
 
   async function resolveOne(product) {
     const trace = [];
+    if (product.img && usable(product.img)) return { source: 'pixabay', url: product.img, fit: 'cover', alt: product.alt || product.name, credit: product.credit, trace: ['live listing photo'] };
     if (product.keep && usable(product.fallback)) return { source: 'static', url: product.fallback, fit: 'cover', alt: product.alt, trace: ['original photo link kept'] };
     if (pxAvailable()) {
       try {
@@ -758,7 +759,7 @@
 
   const BATCH = 24; let BATCH_ALL = false;
   let list = [], shownN = 0, moreEl, moreIO;
-  const hayOf = p => p.hay || (p.hay = (p.name + ' ' + p.title + ' ' + p.cat + ' ' + CAT_LABEL[p.cat] + ' ' + p.brand + ' ' + (p.region || '')).toLowerCase());
+  const hayOf = p => p.hay || (p.hay = (p.name + ' ' + p.title + ' ' + p.cat + ' ' + CAT_LABEL[p.cat] + ' ' + p.brand + ' ' + (p.region || '') + ' ' + (p.tags || '')).toLowerCase());
 
   /* Draw the next batch of cards. Photos already resolved are applied instantly; the rest are queued. */
   function gridMore() {
@@ -807,13 +808,36 @@
   const gridSyncAll = () => entries.forEach((e, id) => gridSetQty(id, cartQty(id)));
 
   function applyFilter() {
-    list = PRODUCTS.filter(p => (gstate.cat === 'All' || p.cat === gstate.cat) && (!gstate.q || gstate.q.split(/\s+/).every(t => hayOf(p).indexOf(t) !== -1)) && (F.max == null || p.price <= F.max) && p.rating >= F.rate && (!F.stock || p.stock > 0) && (!F.wish || wish.has(p.id)));
+    list = PRODUCTS.filter(p => (!p.live || gstate.q || F.wish) && (gstate.cat === 'All' || p.cat === gstate.cat) && (!gstate.q || gstate.q.split(/\s+/).every(t => hayOf(p).indexOf(t) !== -1)) && (F.max == null || p.price <= F.max) && p.rating >= F.rate && (!F.stock || p.stock > 0) && (!F.wish || wish.has(p.id)));
     if (SORTS[F.sort]) list.sort(SORTS[F.sort]);
     grid.innerHTML = ''; entries.clear(); shownN = 0;
     gridMore();
     countEl.textContent = list.length === 1 ? '1 piece' : list.length + ' pieces';
     emptyEl.hidden = list.length > 0;
     if (!list.length) emptyMsg.textContent = F.wish ? 'Your wishlist is empty. Tap the heart on any product to save it.' : gstate.q ? 'No products match “' + search.value.trim() + '”.' : 'No products match these filters.';
+  }
+  /* Nothing in the catalogue matches (for example "tv"): ask the Worker for Pixabay photos with believable INR prices. */
+  const liveTried = new Set(); let liveSeq = 0, liveT = 0;
+  async function liveSearch(q) {
+    if (!q || q.length < 2 || liveTried.has(q)) return;
+    liveTried.add(q);
+    const seq = ++liveSeq;
+    emptyMsg.textContent = 'Searching for “' + q + '”…';
+    try {
+      const ck = 'live|' + q;
+      let rows = store.cache.get(ck);
+      if (!rows) {
+        const { data } = await getJSON(config.SEARCH_ENDPOINT + '?q=' + encodeURIComponent(q), { timeout: config.LIVE_TIMEOUT_MS });
+        rows = data.products || [];
+        if (rows.length) store.cache.set(ck, rows, config.CACHE_TTL_MS);
+      }
+      if (addLive(rows)) saveLive();
+      if (seq === liveSeq && gstate.q === q) applyFilter();     // shows the new items, or the normal "no match" message
+    } catch (e) {
+      liveTried.delete(q);                                       // allow a retry
+      gridLog.warn('live search failed', e.message);
+      if (seq === liveSeq && gstate.q === q && !list.length) emptyMsg.textContent = 'No products match “' + q + '”. Live search is not reachable right now.';
+    }
   }
   function setCat(cat) {
     gstate.cat = cat;
@@ -833,16 +857,18 @@
     $('#clear').addEventListener('click', () => { search.value = ''; gstate.q = ''; resetPlus(); setCat('All'); });
 
     let t = 0;
-    const commit = () => {
+    const commit = now => {
       gstate.q = search.value.trim().toLowerCase();
       if (gstate.q && F.wish) { F.wish = false; syncWish(); }
       if (gstate.q && gstate.cat !== 'All') setCat('All'); else applyFilter();      // a search looks through everything, not just the chip that is on
+      clearTimeout(liveT);
+      if (gstate.q && !list.length && !F.wish) liveT = setTimeout(() => liveSearch(gstate.q), now === true ? 0 : 700);
       if (gstate.q) { const r = $('#products').getBoundingClientRect(); if (r.top > w.innerHeight * 0.5 || r.bottom < 80) $('#products').scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth' }); }
     };
     search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(commit, 120); });
     search.addEventListener('keydown', e => {
       if (e.key !== 'Enter') return;
-      clearTimeout(t); commit();
+      clearTimeout(t); commit(true);
     });
 
     grid.addEventListener('click', e => { const b = e.target.closest('[data-add]'); if (b) cartAdd(b.dataset.add); });
@@ -1275,21 +1301,16 @@
     return out;
   }
   async function askGemini(q, cands) {
-    const key = config.getGeminiKey(); if (!key) throw new Error('no key');
     const lines = cands.map(p => p.id + ' | ' + p.title + ' | ' + CAT_LABEL[p.cat] + ' | ₹' + p.price + ' | ' + p.rating.toFixed(1) + '★' + (p.region ? ' | ' + p.region : '')).join('\n');
-    const body = {
-      systemInstruction: { parts: [{ text: ASST_SYS }] },
-      contents: asstHist.slice(-6).concat([{ role: 'user', parts: [{ text: 'CATALOGUE (id | title | category | price | rating):\n' + lines + '\n\nCustomer: ' + q }] }]),
-      generationConfig: { temperature: 0.4, maxOutputTokens: 700, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } }
-    };
+    const body = { contents: asstHist.slice(-6).concat([{ role: 'user', parts: [{ text: 'CATALOGUE (id | title | category | price | rating):\n' + lines + '\n\nCustomer: ' + q }] }]) };   // the system prompt lives in worker.js
     const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), config.GEMINI_TIMEOUT_MS);
     try {
-      const res = await fetch(config.GEMINI_ENDPOINT + encodeURIComponent(config.GEMINI_MODEL) + ':generateContent', {
-        method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body)
+      const res = await fetch(config.AI_ENDPOINT, {
+        method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       });
-      if (!res.ok) { let m = ''; try { m = (await res.json()).error.message; } catch (_) {} throw new Error('Gemini ' + res.status + (m ? ': ' + m : '')); }
+      if (!res.ok) { let m = ''; try { m = (await res.json()).detail || ''; } catch (_) {} throw new Error('Assistant ' + res.status + (m ? ': ' + m : '')); }
       const data = await res.json();
-      const txt = ((((data.candidates || [])[0] || {}).content || {}).parts || []).map(x => x.text || '').join('').replace(/```json|```/g, '').trim();
+      const txt = String(data.text || '').replace(/```json|```/g, '').trim();
       let out; try { out = JSON.parse(txt); } catch (_) { out = { reply: txt, ids: [] }; }
       const ids = (Array.isArray(out.ids) ? out.ids : []).filter(id => BY_ID.has(id)).slice(0, 4);
       const reply = String(out.reply || '').trim();
@@ -1310,7 +1331,6 @@
       local.rows.forEach(x => { if (!results.has(x.p.id)) queueImage(x.p); });
       say('b', (local.partial ? '<p class="note">No product matches every word you typed, so these are the closest matches.</p>' : '') + 'Found ' + local.total + (local.total === 1 ? ' match' : ' matches') + (local.max ? ' under ' + money(local.max) : '') + (local.min ? ' above ' + money(local.min) : '') + '. Top picks from the catalogue:' + local.rows.map(x => asstRow(x.p)).join(''));
     };
-    if (!config.getGeminiKey()) { localReply(); return; }
     const wait = say('b', '<span class="think">Thinking…</span>'), form = $('#asstForm');
     form.setAttribute('aria-busy', 'true');
     try {
@@ -1561,7 +1581,7 @@
     heroInit();
     fxInit();
 
-    mainLog.info(config.getPixabayKey() ? 'Pixabay key found: dynamic photos enabled.' : 'No Pixabay key set: using DummyJSON, then the curated photos. See config.PIXABAY_KEY at the top of app.js.');
+    mainLog.info('Photos, live search and the AI assistant go through the /api Cloudflare Worker (no keys in the browser).');
 
     bus.emit('images:done', { sources: [] });                          // credits line (the banner is Unsplash)
   }
