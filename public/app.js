@@ -1277,10 +1277,10 @@
   const asstHit = (h, t) => t.length < 3 ? (' ' + h + ' ').indexOf(' ' + t + ' ') !== -1 : (h.indexOf(t) !== -1 || h.indexOf(asstStem(t)) !== -1);
   function asstFind(q) {
     let s = q.toLowerCase().replace(/(\d),(?=\d{3}\b)/g, '$1'), max = null, min = null, cat = '', m;
-    const num = (v, k) => +v * (k ? 1000 : 1), CUR = '(?:rs\\.?|inr|₹)?\\s*';
-    if ((m = s.match(new RegExp('\\bbetween\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?\\s*(?:and|to|-)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?')))) { min = num(m[1], m[2]); max = num(m[3], m[4]); if (min > max) { const t = min; min = max; max = t; } s = s.replace(m[0], ' '); }
-    if (max == null && (m = s.match(new RegExp('\\b(?:under|below|less than|upto|up to|within|maximum|max)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?\\b')))) { max = num(m[1], m[2]); s = s.replace(m[0], ' '); }
-    if (min == null && (m = s.match(new RegExp('\\b(?:above|over|more than|minimum|min)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k)?\\b')))) { min = num(m[1], m[2]); s = s.replace(m[0], ' '); }
+    const num = (v, k) => +v * (!k ? 1 : k === 'k' ? 1000 : /^cr/.test(k) ? 1e7 : /^la/.test(k) ? 1e5 : 1), CUR = '(?:rs\\.?|inr|₹)?\\s*';
+    if ((m = s.match(new RegExp('\\bbetween\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?\\s*(?:and|to|-)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?')))) { min = num(m[1], m[2]); max = num(m[3], m[4]); if (min > max) { const t = min; min = max; max = t; } s = s.replace(m[0], ' '); }
+    if (max == null && (m = s.match(new RegExp('\\b(?:under|below|less than|upto|up to|within|maximum|max)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?\\b')))) { max = num(m[1], m[2]); s = s.replace(m[0], ' '); }
+    if (min == null && (m = s.match(new RegExp('\\b(?:above|over|more than|minimum|min)\\s*' + CUR + '(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lacs?|crores?)?\\b')))) { min = num(m[1], m[2]); s = s.replace(m[0], ' '); }
     const rate = /top rated|best rated|highly rated|4\s*\+|4 stars?/.test(s) ? 4 : 0, cheap = /cheap|lowest|budget/.test(s), deals = /deal|discount|offer|sale/.test(s);
     const toks = s.replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !/^\d+$/.test(w) && !STOP.has(w) && !/^(deal|deals|discount|offer|sale|budget|lowest)$/.test(w) && !(CATWORDS[w] && (cat = CATWORDS[w])));
     const pool = PRODUCTS.filter(p => p.stock > 0 && (max == null || p.price <= max) && (min == null || p.price >= min) && p.rating >= rate && (!cat || p.cat === cat))

@@ -10,8 +10,8 @@
      GEMINI_API_KEY   your Google AI Studio key
    Optional plain variable: GEMINI_MODEL (default gemini-2.5-flash), ALLOWED_ORIGINS (comma list of extra origins). */
 
-const DEFAULT_MODEL = 'gemini-3.8-flash';          // gemini-2.5-* is retired for new API keys (404)
-const FALLBACK_MODEL = 'gemini-flash-latest';
+const DEFAULT_MODEL = 'gemini-flash-latest';       // alias that always points at the current Flash model; unknown names fall through the list in gemini()
+const FALLBACK_MODEL = 'gemini-3.8-flash';
 const ADJ = ['Aura', 'Nova', 'Zenith', 'Lumen', 'Ember', 'Onyx', 'Solace', 'Vertex', 'Haven', 'Pulse', 'Echo', 'Drift'];
 const CATS = ['Fashion', 'Electronics', 'Home', 'Beauty', 'Crafts'];
 const PEOPLE = ['man', 'woman', 'girl', 'boy', 'people', 'child', 'children', 'baby', 'portrait', 'model', 'face', 'couple', 'family'];
@@ -109,18 +109,46 @@ async function handlePixabay(request, env) {
 }
 
 /* ---------------- Gemini ---------------- */
+async function geminiCall(env, model, body) {
+  return fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY }, body: JSON.stringify(body)
+  });
+}
 async function gemini(env, body) {
   if (!env.GEMINI_API_KEY) throw Object.assign(new Error('GEMINI_API_KEY is not set'), { status: 500 });
-  let res;
-  for (const model of [env.GEMINI_MODEL || DEFAULT_MODEL, FALLBACK_MODEL]) {
-    res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY }, body: JSON.stringify(body)
-    });
-    if (res.status !== 404) break;                 // unknown/retired model name: try the next one
+  const models = [...new Set([env.GEMINI_MODEL, DEFAULT_MODEL, FALLBACK_MODEL, 'gemini-2.5-flash'].filter(Boolean))];
+  let lastErr = 'no model tried';
+  for (const model of models) {
+    /* Gemini "thinking" tokens count against maxOutputTokens, so a small budget can leave an EMPTY reply.
+       Turn thinking off first; if the model rejects that (HTTP 400) retry without it, with more room. */
+    const gc = body.generationConfig || {};
+    const tries = [
+      { ...body, generationConfig: { ...gc, thinkingConfig: { thinkingBudget: 0 } } },
+      { ...body, generationConfig: { ...gc, maxOutputTokens: Math.max(gc.maxOutputTokens || 0, 4096) } }
+    ];
+    for (const b of tries) {
+      let res;
+      try { res = await geminiCall(env, model, b); } catch (e) { lastErr = model + ': ' + e.message; break; }
+      if (res.status === 400 && b === tries[0]) { lastErr = model + ': HTTP 400 (retrying without thinking config)'; continue; }
+      if (!res.ok) {
+        let msg = ''; try { msg = ((await res.json()).error || {}).message || ''; } catch (_) {}
+        lastErr = model + ': HTTP ' + res.status + (msg ? ' ' + msg.slice(0, 220) : '');
+        if (res.status === 401 || res.status === 403) throw Object.assign(new Error('Gemini rejected the key. ' + lastErr), { status: 502 });   // bad / leaked / restricted key: other models will not help
+        break;                                               // 404 unknown model, 429, 5xx: next model
+      }
+      const data = await res.json();
+      const text = (((data.candidates || [])[0] || {}).content || {}).parts?.map(x => x.text || '').join('') || '';
+      if (text.trim()) return text;
+      lastErr = model + ': empty reply (' + ((data.candidates || [])[0] || {}).finishReason + ')';
+      break;
+    }
   }
-  if (!res.ok) throw Object.assign(new Error('Gemini HTTP ' + res.status), { status: 502 });
-  const data = await res.json();
-  return (((data.candidates || [])[0] || {}).content || {}).parts?.map(x => x.text || '').join('') || '';
+  throw Object.assign(new Error('Gemini failed. ' + lastErr), { status: 502 });
+}
+/* Models sometimes wrap JSON in prose or code fences: take the outermost {...}. */
+function parseJson(txt) {
+  const s = String(txt || '').replace(/```json|```/g, '').trim(), a = s.indexOf('{'), b = s.lastIndexOf('}');
+  return JSON.parse(a >= 0 && b > a ? s.slice(a, b + 1) : s);
 }
 
 const ASSISTANT_SYSTEM =
@@ -163,7 +191,7 @@ async function profileFor(env, q) {
         contents: [{ role: 'user', parts: [{ text: q }] }],
         generationConfig: { temperature: 0, maxOutputTokens: 600, responseMimeType: 'application/json' }
       });
-      const o = JSON.parse(txt.replace(/```json|```/g, '').trim());
+      const o = parseJson(txt);
       if (o.product === false) return null;
       let min = Math.max(49, Math.round(+o.minInr) || 0), max = Math.min(500000, Math.round(+o.maxInr) || 0);
       if (!(min > 0 && max > min)) { min = 499; max = 2999; }
@@ -173,15 +201,16 @@ async function profileFor(env, q) {
   return { name: titleCase(q), cat: 'Home', min: 499, max: 2999, pq: q };
 }
 
-function buildProducts(prof, q, hits) {
+/* level 0 = strict (head noun + banned words), 1 = drop the banned words, 2 = only people/URL checks. handleSearch relaxes until something is found. */
+function buildProducts(prof, q, hits, level = 0) {
   const words = new Set((prof.pq + ' ' + q + ' ' + (prof.alts || '')).toLowerCase().split(/\s+/).filter(w => w.length > 1).map(stem));
   const bans = new Set(String(prof.ban || '').split(/\s+/).filter(Boolean));
   const seen = new Set(), out = [];
   for (const h of hits) {
     const tags = String(h.tags || '').toLowerCase().split(/,\s*/);
     const headNoun = tags.some(t => { const parts = t.trim().split(/\s+/); return words.has(stem(parts[parts.length - 1])); });
-    if (!headNoun) continue;                                                // some tag must name the product itself ("tv tower" does not)
-    if (bans.size && tags.join(' ').split(/\s+/).some(w => bans.has(w))) continue;
+    if (level < 2 && !headNoun) continue;                                   // some tag must name the product itself ("tv tower" does not)
+    if (level < 1 && bans.size && tags.join(' ').split(/\s+/).some(w => bans.has(w))) continue;
     if (tags.some(t => PEOPLE.includes(t))) continue;                       // product shots only
     if (!pixabayImageOk(h.webformatURL)) continue;
     if (seen.has(h.id)) continue; seen.add(h.id);
@@ -213,8 +242,9 @@ async function vetWithGemini(env, prof, q, products, hitsById) {
       contents: [{ role: 'user', parts: [{ text: 'Product: ' + prof.name + ' (shopper searched "' + q + '")\nPhotos (id: tags):\n' + list }] }],
       generationConfig: { temperature: 0, maxOutputTokens: 600, responseMimeType: 'application/json' }
     });
-    const ids = new Set((JSON.parse(txt.replace(/```json|```/g, '').trim()).ids || []).map(String));
-    return products.filter(p => ids.has(p.id.slice(5))).slice(0, 8);
+    const ids = new Set((parseJson(txt).ids || []).map(String));
+    const kept = products.filter(p => ids.has(p.id.slice(5))).slice(0, 8);
+    return kept.length ? kept : products.slice(0, 8);       // an over-strict vet must never leave the shopper with nothing
   } catch (_) { return products.slice(0, 8); }
 }
 
@@ -246,7 +276,9 @@ async function handleSearch(request, env, ctx) {
   if (!prof) return json({ products: [], note: 'not a shoppable product' });
   const data = await pixabay(env, { q: prof.pq, lang: 'en', image_type: 'photo', safesearch: 'true', order: 'popular', per_page: '60', min_width: '600', min_height: '400' });
   const hitsById = new Map((data.hits || []).map(h => [String(h.id), h.tags]));
-  const products = await vetWithGemini(env, prof, q, buildProducts(prof, q, data.hits || []), hitsById);
+  let cands = [];
+  for (let level = 0; level <= (env.GEMINI_API_KEY ? 2 : 1) && cands.length < 4; level++) cands = buildProducts(prof, q, data.hits || [], level);
+  const products = await vetWithGemini(env, prof, q, cands, hitsById);
   const res = json({ products, query: q }, 200, { 'Cache-Control': 'public, max-age=3600' });
   if (products.length) ctx.waitUntil(cache.put(cacheKey, new Response(JSON.stringify({ products, query: q }), { headers: { 'Cache-Control': 'public, max-age=86400' } })));
   return res;
@@ -263,7 +295,14 @@ export default {
       if (url.pathname === '/api/img') return await handleImage(request, env);
       if (url.pathname === '/api/search') return await handleSearch(request, env, ctx);
       if (url.pathname === '/api/assistant') return await handleAssistant(request, env);
-      if (url.pathname === '/api/health') return json({ ok: true, pixabay: !!env.PIXABAY_KEY, gemini: !!env.GEMINI_API_KEY });
+      if (url.pathname === '/api/health') {
+        const out = { ok: true, pixabay: !!env.PIXABAY_KEY, gemini: !!env.GEMINI_API_KEY };
+        if (url.searchParams.has('deep')) {                    // /api/health?deep=1 : really calls both services and reports what they said
+          try { const d = await pixabay(env, { q: 'television', per_page: '3' }); out.pixabayTest = 'ok, ' + d.total + ' results'; } catch (e) { out.ok = false; out.pixabayTest = 'FAILED: ' + e.message; }
+          try { out.geminiTest = 'ok: ' + (await gemini(env, { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word OK' }] }], generationConfig: { maxOutputTokens: 20 } })).trim().slice(0, 40); } catch (e) { out.ok = false; out.geminiTest = 'FAILED: ' + e.message; }
+        }
+        return json(out);
+      }
       return json({ error: 'not found' }, 404);
     } catch (e) {
       const status = e.status || 502;
